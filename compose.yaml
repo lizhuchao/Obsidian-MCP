@@ -1,0 +1,20 @@
+services:
+  obsidian-mcp:
+    build: ./obsidian-mcp-app
+    container_name: restricted-obsidian-mcp
+    restart: unless-stopped
+    environment:
+      VAULT_ROOT: ${VAULT_ROOT:-/vault}
+      MAX_CONTENT_BYTES: ${MAX_CONTENT_BYTES:-300000}
+      MAX_ATTACHMENT_BYTES: ${MAX_ATTACHMENT_BYTES:-15000000}
+      PUBLIC_HOST: ${PUBLIC_HOST:-obsidian-mcp.example.com}
+    volumes:
+      - ${HOST_VAULT_PATH:-/volume1/Obsidian}:${VAULT_ROOT:-/vault}
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: chatgpt-obsidian-cloudflared
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN:?set CLOUDFLARE_TUNNEL_TOKEN in your environment or .env file}
+    depends_on:
+      - obsidian-mcp

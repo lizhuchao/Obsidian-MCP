@@ -1,0 +1,4 @@
+mcp[cli]>=1.13.0,<2.0.0
+starlette>=0.37.0
+uvicorn[standard]>=0.30.0
+requests>=2.32.0
