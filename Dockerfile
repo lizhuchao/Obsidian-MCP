@@ -15,6 +15,8 @@ RUN pip install \
     -r /app/requirements.txt
 
 COPY app.py /app/app.py
+COPY kb_seed.py /app/kb_seed.py
+COPY scripts /app/scripts
 
 EXPOSE 8000
 

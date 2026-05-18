@@ -10,6 +10,30 @@ from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import requests
+from kb_seed import (
+    CONTEXT_PACKS_REL,
+    CONTEXT_PACK_SPECS,
+    INDEXES_REL,
+    INDEX_TITLES,
+    SCHEMAS_REL,
+    SCHEMA_ALIASES,
+    SCHEMA_SPECS,
+    bootstrap_llm_knowledge_base_files,
+    context_pack_relative_path,
+    generated_block_end,
+    generated_block_start,
+    index_relative_path,
+    note_link,
+    render_context_pack_markdown,
+    render_decision_log_block,
+    render_index_markdown,
+    render_knowledge_map_block,
+    render_schema_markdown,
+    render_stale_notes_block,
+    render_workflows_block,
+    replace_generated_block,
+    schema_relative_path,
+)
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
@@ -38,6 +62,9 @@ CAPTURE_DIR = (VAULT_ROOT / CAPTURE_REL).resolve()
 KNOWLEDGE_DIR = (VAULT_ROOT / KNOWLEDGE_REL).resolve()
 SOURCES_DIR = (VAULT_ROOT / SOURCES_REL).resolve()
 TEMPLATES_DIR = (VAULT_ROOT / TEMPLATES_REL).resolve()
+SCHEMAS_DIR = (VAULT_ROOT / SCHEMAS_REL).resolve()
+INDEXES_DIR = (VAULT_ROOT / INDEXES_REL).resolve()
+CONTEXT_PACKS_DIR = (VAULT_ROOT / CONTEXT_PACKS_REL).resolve()
 ASSETS_DIR = (VAULT_ROOT / ASSETS_REL).resolve()
 ARCHIVE_DIR = (VAULT_ROOT / ARCHIVE_REL).resolve()
 VERSIONS_DIR = (VAULT_ROOT / VERSIONS_REL).resolve()
@@ -46,7 +73,7 @@ DELETED_DIR = (VAULT_ROOT / DELETED_REL).resolve()
 MAX_CONTENT_BYTES = int(os.environ.get("MAX_CONTENT_BYTES", "300000"))
 MAX_ATTACHMENT_BYTES = int(os.environ.get("MAX_ATTACHMENT_BYTES", "15000000"))
 
-APP_VERSION = "2026-05-16-lifecycle-archive-rollback-asia-shanghai-inbox-archive-no-auth"
+APP_VERSION = "2026-05-17-llm-knowledge-base-bootstrap-schema-index-context-audit"
 
 
 def now_local() -> str:
@@ -182,6 +209,9 @@ def normalize_read_path(relative_path: str) -> Path:
         KNOWLEDGE_DIR,
         SOURCES_DIR,
         TEMPLATES_DIR,
+        SCHEMAS_DIR,
+        INDEXES_DIR,
+        CONTEXT_PACKS_DIR,
         ASSETS_DIR,
     ]
 
@@ -195,6 +225,242 @@ def normalize_read_path(relative_path: str) -> Path:
         raise ValueError("Only Markdown files are readable through fetch_note")
 
     return candidate
+
+
+def normalize_schema_name(schema_name: str) -> str:
+    clean = schema_name.strip().lower()
+    if clean not in SCHEMA_SPECS:
+        raise ValueError(f"Unsupported schema: {schema_name}")
+    return clean
+
+
+def normalize_context_pack_name(name: str) -> str:
+    clean = name.strip()
+    if clean not in CONTEXT_PACK_SPECS:
+        raise ValueError(f"Unsupported context pack: {name}")
+    return clean
+
+
+def frontmatter_map(text: str) -> dict[str, str]:
+    if not text.startswith("---\n"):
+        return {}
+
+    end = text.find("\n---", 4)
+    if end == -1:
+        return {}
+
+    data: dict[str, str] = {}
+    for line in text[4:end].splitlines():
+        if ":" not in line or line.startswith(" "):
+            continue
+        key, value = line.split(":", 1)
+        data[key.strip()] = value.strip()
+    return data
+
+
+def markdown_sections(text: str) -> set[str]:
+    sections = set()
+    for line in text.splitlines():
+        if line.startswith("## "):
+            sections.add(line[3:].strip())
+    return sections
+
+
+def note_record_from_path(path: Path, stale_days: int = 180) -> dict[str, Any]:
+    text = read_text_file(path)
+    meta = frontmatter_map(text)
+    modified_at = datetime.fromtimestamp(path.stat().st_mtime, LOCAL_TZ)
+    age_days = max(0, (datetime.now(LOCAL_TZ) - modified_at).days)
+    return {
+        "relative_path": str(path.relative_to(VAULT_ROOT)),
+        "title": title_from_markdown(path, text),
+        "type": meta.get("type"),
+        "status": meta.get("status"),
+        "tags": meta.get("tags"),
+        "modified_at": modified_at.isoformat(),
+        "age_days": age_days,
+        "is_stale": meta.get("status") == "verified" and age_days >= stale_days,
+        "content": text,
+    }
+
+
+def collect_knowledge_note_records(stale_days: int = 180) -> list[dict[str, Any]]:
+    records = []
+    for path in all_markdown_files(KNOWLEDGE_DIR):
+        try:
+            records.append(note_record_from_path(path, stale_days=stale_days))
+        except Exception:
+            continue
+    return records
+
+
+def schema_name_for_note(text: str, schema_name: str | None = None) -> str:
+    if schema_name:
+        return normalize_schema_name(schema_name)
+
+    inferred = frontmatter_value(text, "type")
+    if not inferred:
+        raise ValueError("schema_name is required when note type is missing")
+
+    alias = SCHEMA_ALIASES.get(inferred.strip().lower())
+    if not alias:
+        raise ValueError(f"Unsupported note type for schema validation: {inferred}")
+    return alias
+
+
+def validate_note_text(text: str, schema_name: str) -> dict[str, Any]:
+    schema_key = normalize_schema_name(schema_name)
+    spec = SCHEMA_SPECS[schema_key]
+    meta = frontmatter_map(text)
+    sections = markdown_sections(text)
+
+    missing_required_frontmatter = [
+        field for field in spec["required_frontmatter"]
+        if not meta.get(field)
+    ]
+    missing_recommended_frontmatter = [
+        field for field in spec["recommended_frontmatter"]
+        if not meta.get(field)
+    ]
+    missing_required_sections = [
+        section for section in spec["required_sections"]
+        if section not in sections
+    ]
+    missing_recommended_sections = [
+        section for section in spec["recommended_sections"]
+        if section not in sections
+    ]
+
+    return {
+        "schema_name": schema_key,
+        "missing_required_frontmatter": missing_required_frontmatter,
+        "missing_recommended_frontmatter": missing_recommended_frontmatter,
+        "missing_required_sections": missing_required_sections,
+        "missing_recommended_sections": missing_recommended_sections,
+        "is_valid": not (
+            missing_required_frontmatter or missing_required_sections
+        ),
+    }
+
+
+def embedded_asset_paths(text: str) -> list[str]:
+    return re.findall(r"!\[\[([^\]]+)\]\]", text)
+
+
+def ensure_support_docs_exist(note_records: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    return bootstrap_llm_knowledge_base_files(
+        vault_root=VAULT_ROOT,
+        write_text_file=write_text_file,
+        overwrite=False,
+        note_records=note_records or [],
+    )
+
+
+def generated_index_content(name: str, note_records: list[dict[str, Any]], stale_days: int = 180) -> str:
+    if name == "knowledge-map":
+        return render_knowledge_map_block(note_records)
+    if name == "workflows":
+        return render_workflows_block(note_records)
+    if name == "decision-log":
+        return render_decision_log_block(note_records)
+    if name == "stale-notes":
+        return render_stale_notes_block(note_records, stale_days)
+    raise ValueError(f"Unsupported generated index: {name}")
+
+
+def update_generated_index(name: str, note_records: list[dict[str, Any]], stale_days: int = 180) -> str:
+    relative_path = index_relative_path(name)
+    path = (VAULT_ROOT / relative_path).resolve()
+    default_text = render_index_markdown(name, note_records=note_records, stale_days=stale_days)
+    if not path.exists():
+        write_text_file(path, default_text)
+        return relative_path
+
+    text = read_text_file(path)
+    new_text = replace_generated_block(
+        text,
+        name,
+        generated_index_content(name, note_records, stale_days),
+    )
+    if new_text != text:
+        write_text_file(path, new_text)
+    return relative_path
+
+
+def duplicate_note_titles(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        key = record["title"].strip().lower()
+        grouped.setdefault(key, []).append(record)
+
+    return [
+        {
+            "title": items[0]["title"],
+            "count": len(items),
+            "relative_paths": [item["relative_path"] for item in items],
+        }
+        for items in grouped.values()
+        if len(items) > 1
+    ]
+
+
+def stale_note_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "relative_path": record["relative_path"],
+            "title": record["title"],
+            "age_days": record["age_days"],
+        }
+        for record in records
+        if record["is_stale"]
+    ]
+
+
+def broken_asset_links(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    broken = []
+    for record in records:
+        for relative_asset in embedded_asset_paths(record["content"]):
+            asset_path = (VAULT_ROOT / relative_asset).resolve()
+            if not asset_path.exists():
+                broken.append(
+                    {
+                        "relative_path": record["relative_path"],
+                        "title": record["title"],
+                        "missing_asset": relative_asset,
+                    }
+                )
+    return broken
+
+
+def schema_violations(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    violations = []
+    for record in records:
+        inferred_type = (record.get("type") or "").strip().lower()
+        alias = SCHEMA_ALIASES.get(inferred_type)
+        if not alias:
+            violations.append(
+                {
+                    "relative_path": record["relative_path"],
+                    "title": record["title"],
+                    "reason": f"Unsupported or missing schema type: {record.get('type')}",
+                }
+            )
+            continue
+
+        result = validate_note_text(record["content"], alias)
+        if result["is_valid"]:
+            continue
+
+        violations.append(
+            {
+                "relative_path": record["relative_path"],
+                "title": record["title"],
+                "schema_name": alias,
+                "missing_required_frontmatter": result["missing_required_frontmatter"],
+                "missing_required_sections": result["missing_required_sections"],
+            }
+        )
+    return violations
 
 
 def set_frontmatter(text: str, updates: dict[str, str]) -> str:
@@ -415,6 +681,7 @@ def health_check() -> dict[str, Any]:
     """Check the Obsidian KB MCP server status and allowed business operations."""
     for d in [
         INBOX_DIR, CAPTURE_DIR, KNOWLEDGE_DIR, SOURCES_DIR, TEMPLATES_DIR,
+        SCHEMAS_DIR, INDEXES_DIR, CONTEXT_PACKS_DIR,
         ASSETS_DIR, ARCHIVE_DIR, VERSIONS_DIR, DELETED_DIR
     ]:
         d.mkdir(parents=True, exist_ok=True)
@@ -442,6 +709,20 @@ def health_check() -> dict[str, Any]:
             "list_versions",
             "fetch_version",
             "rollback_knowledge_note",
+            "bootstrap_llm_knowledge_base",
+            "list_schemas",
+            "fetch_schema",
+            "list_context_packs",
+            "fetch_context_pack",
+            "validate_note_against_schema",
+            "generate_indexes",
+            "update_knowledge_map",
+            "update_decision_log",
+            "audit_knowledge_base",
+            "find_duplicate_notes",
+            "find_stale_notes",
+            "find_broken_asset_links",
+            "find_schema_violations",
         ],
         "write_allowed": [
             INBOX_REL,
@@ -453,12 +734,18 @@ def health_check() -> dict[str, Any]:
             "update Knowledge with automatic version archive",
             "soft archive Knowledge into Archive/Deleted",
             "rollback Knowledge from Archive/Versions",
+            SCHEMAS_REL,
+            INDEXES_REL,
+            CONTEXT_PACKS_REL,
         ],
         "read_allowed": [
             INBOX_REL,
             KNOWLEDGE_REL,
             SOURCES_REL,
             TEMPLATES_REL,
+            SCHEMAS_REL,
+            INDEXES_REL,
+            CONTEXT_PACKS_REL,
             ASSETS_REL,
             VERSIONS_REL,
             DELETED_REL,
@@ -943,7 +1230,8 @@ def search_notes(query: str, scope: str = "Knowledge", limit: int = 10) -> list[
     """
     Search Markdown notes for future reference.
     Default scope is Knowledge so verified notes rank first.
-    Valid scopes: Knowledge, Sources, Templates, Inbox, All, Archive.
+    Valid scopes: Knowledge, Sources, Templates, Inbox, Schemas, Indexes,
+    Context_Packs, All, Archive.
     """
     q = query.strip()
     if not q:
@@ -957,7 +1245,10 @@ def search_notes(query: str, scope: str = "Knowledge", limit: int = 10) -> list[
         "Sources": [SOURCES_DIR],
         "Templates": [TEMPLATES_DIR],
         "Inbox": [INBOX_DIR],
-        "All": [KNOWLEDGE_DIR, SOURCES_DIR, TEMPLATES_DIR, INBOX_DIR],
+        "Schemas": [SCHEMAS_DIR],
+        "Indexes": [INDEXES_DIR],
+        "Context_Packs": [CONTEXT_PACKS_DIR],
+        "All": [KNOWLEDGE_DIR, SOURCES_DIR, TEMPLATES_DIR, INBOX_DIR, SCHEMAS_DIR, INDEXES_DIR, CONTEXT_PACKS_DIR],
         "Archive": [VERSIONS_DIR, DELETED_DIR],
     }
 
@@ -1173,9 +1464,262 @@ def capture_source_note(
     }
 
 
+@mcp.tool()
+def bootstrap_llm_knowledge_base(overwrite: bool = False) -> dict[str, Any]:
+    """
+    Create the top-level Schemas, Indexes, and Context_Packs directories and
+    seed them with the canonical Phase 1 Markdown documents.
+    """
+    records = collect_knowledge_note_records()
+    result = bootstrap_llm_knowledge_base_files(
+        vault_root=VAULT_ROOT,
+        write_text_file=write_text_file,
+        overwrite=overwrite,
+        note_records=records,
+    )
+    return {
+        "ok": True,
+        "action": "bootstrapped_llm_knowledge_base",
+        **result,
+    }
+
+
+@mcp.tool()
+def list_schemas() -> list[dict[str, Any]]:
+    """List the canonical schema documents available for the knowledge base."""
+    SCHEMAS_DIR.mkdir(parents=True, exist_ok=True)
+    result = []
+    for schema_name, spec in SCHEMA_SPECS.items():
+        relative_path = schema_relative_path(schema_name)
+        path = (VAULT_ROOT / relative_path).resolve()
+        result.append(
+            {
+                "schema_name": schema_name,
+                "title": spec["title"],
+                "relative_path": relative_path,
+                "default_directory": spec["default_directory"],
+                "exists": path.exists(),
+            }
+        )
+    return result
+
+
+@mcp.tool()
+def fetch_schema(schema_name: str) -> dict[str, Any]:
+    """Fetch a schema Markdown document from Schemas/."""
+    schema_key = normalize_schema_name(schema_name)
+    path = normalize_read_path(schema_relative_path(schema_key))
+    if not path.exists():
+        raise FileNotFoundError("Schema note not found")
+
+    text = read_text_file(path)
+    return {
+        "ok": True,
+        "schema_name": schema_key,
+        "relative_path": str(path.relative_to(VAULT_ROOT)),
+        "title": title_from_markdown(path, text),
+        "content": text,
+    }
+
+
+@mcp.tool()
+def list_context_packs() -> list[dict[str, Any]]:
+    """List the canonical context-pack documents available for task execution."""
+    CONTEXT_PACKS_DIR.mkdir(parents=True, exist_ok=True)
+    result = []
+    for name, spec in CONTEXT_PACK_SPECS.items():
+        relative_path = context_pack_relative_path(name)
+        path = (VAULT_ROOT / relative_path).resolve()
+        result.append(
+            {
+                "context_pack_name": name,
+                "title": spec["title"],
+                "relative_path": relative_path,
+                "exists": path.exists(),
+            }
+        )
+    return result
+
+
+@mcp.tool()
+def fetch_context_pack(name: str) -> dict[str, Any]:
+    """Fetch a context-pack Markdown document from Context_Packs/."""
+    pack_name = normalize_context_pack_name(name)
+    path = normalize_read_path(context_pack_relative_path(pack_name))
+    if not path.exists():
+        raise FileNotFoundError("Context pack not found")
+
+    text = read_text_file(path)
+    return {
+        "ok": True,
+        "context_pack_name": pack_name,
+        "relative_path": str(path.relative_to(VAULT_ROOT)),
+        "title": title_from_markdown(path, text),
+        "content": text,
+    }
+
+
+@mcp.tool()
+def validate_note_against_schema(relative_path: str, schema_name: str | None = None) -> dict[str, Any]:
+    """
+    Validate an Inbox or Knowledge note against one of the canonical schemas.
+    Checks required frontmatter and required section headings only.
+    """
+    path = normalize_read_path(relative_path)
+    if not path.exists():
+        raise FileNotFoundError("Note not found")
+
+    text = read_text_file(path)
+    result = validate_note_text(text, schema_name_for_note(text, schema_name=schema_name))
+    result["ok"] = True
+    result["relative_path"] = str(path.relative_to(VAULT_ROOT))
+    return result
+
+
+@mcp.tool()
+def update_knowledge_map(stale_days: int = 180) -> dict[str, Any]:
+    """Refresh the auto-generated block in Indexes/knowledge-map.md."""
+    records = collect_knowledge_note_records(stale_days=stale_days)
+    ensure_support_docs_exist(note_records=records)
+    relative_path = update_generated_index("knowledge-map", records, stale_days=stale_days)
+    return {
+        "ok": True,
+        "action": "updated_knowledge_map",
+        "relative_path": relative_path,
+    }
+
+
+@mcp.tool()
+def update_decision_log(stale_days: int = 180) -> dict[str, Any]:
+    """Refresh the auto-generated block in Indexes/decision-log.md."""
+    records = collect_knowledge_note_records(stale_days=stale_days)
+    ensure_support_docs_exist(note_records=records)
+    relative_path = update_generated_index("decision-log", records, stale_days=stale_days)
+    return {
+        "ok": True,
+        "action": "updated_decision_log",
+        "relative_path": relative_path,
+    }
+
+
+@mcp.tool()
+def generate_indexes(stale_days: int = 180) -> dict[str, Any]:
+    """
+    Rebuild the generated sections of index notes without overwriting the
+    surrounding hand-written content.
+    """
+    records = collect_knowledge_note_records(stale_days=stale_days)
+    ensure_support_docs_exist(note_records=records)
+
+    changed_files = []
+    for name in ["knowledge-map", "workflows", "decision-log", "stale-notes"]:
+        changed_files.append(update_generated_index(name, records, stale_days=stale_days))
+
+    return {
+        "ok": True,
+        "action": "generated_indexes",
+        "changed_files": changed_files,
+    }
+
+
+@mcp.tool()
+def find_duplicate_notes() -> list[dict[str, Any]]:
+    """Find duplicate titles under Knowledge/."""
+    return duplicate_note_titles(collect_knowledge_note_records())
+
+
+@mcp.tool()
+def find_stale_notes(stale_days: int = 180) -> list[dict[str, Any]]:
+    """Find verified notes that have not been updated for a while."""
+    return stale_note_records(collect_knowledge_note_records(stale_days=stale_days))
+
+
+@mcp.tool()
+def find_broken_asset_links() -> list[dict[str, Any]]:
+    """Find embedded assets referenced by Knowledge notes that do not exist."""
+    return broken_asset_links(collect_knowledge_note_records())
+
+
+@mcp.tool()
+def find_schema_violations() -> list[dict[str, Any]]:
+    """Find Knowledge notes missing schema-required metadata or sections."""
+    return schema_violations(collect_knowledge_note_records())
+
+
+@mcp.tool()
+def audit_knowledge_base(stale_days: int = 180, inbox_backlog_threshold: int = 20) -> dict[str, Any]:
+    """
+    Run a non-destructive health audit against the vault and return findings.
+    """
+    records = collect_knowledge_note_records(stale_days=stale_days)
+    inbox_count = len(list(INBOX_DIR.glob("*.md"))) if INBOX_DIR.exists() else 0
+    duplicates = duplicate_note_titles(records)
+    stale = stale_note_records(records)
+    broken = broken_asset_links(records)
+    violations = schema_violations(records)
+    missing_metadata = [
+        {
+            "relative_path": record["relative_path"],
+            "title": record["title"],
+            "missing_fields": [
+                field for field in ["type", "status", "tags"]
+                if not frontmatter_map(record["content"]).get(field)
+            ],
+        }
+        for record in records
+        if any(not frontmatter_map(record["content"]).get(field) for field in ["type", "status", "tags"])
+    ]
+    knowledge_drafts = [
+        {
+            "relative_path": record["relative_path"],
+            "title": record["title"],
+        }
+        for record in records
+        if (record.get("status") or "").strip().lower() == "draft"
+    ]
+
+    recommendations = []
+    if inbox_count > inbox_backlog_threshold:
+        recommendations.append("Inbox 堆积较多，优先清理待确认草稿。")
+    if duplicates:
+        recommendations.append("处理重复标题，避免 LLM 选择错误知识卡。")
+    if stale:
+        recommendations.append("复查长期未更新但仍是 verified 的知识卡。")
+    if broken:
+        recommendations.append("补齐丢失的 Assets 或修复嵌入链接。")
+    if violations or missing_metadata:
+        recommendations.append("按 schema 补齐 frontmatter 和必填章节。")
+    if not recommendations:
+        recommendations.append("当前知识库未发现高优先级结构问题。")
+
+    return {
+        "ok": True,
+        "summary": {
+            "inbox_backlog_count": inbox_count,
+            "knowledge_draft_count": len(knowledge_drafts),
+            "duplicate_title_count": len(duplicates),
+            "stale_note_count": len(stale),
+            "missing_metadata_count": len(missing_metadata),
+            "broken_asset_link_count": len(broken),
+            "schema_violation_count": len(violations),
+            "rollback_audit_supported": True,
+        },
+        "checks": {
+            "inbox_backlog_exceeded": inbox_count > inbox_backlog_threshold,
+            "knowledge_drafts": knowledge_drafts,
+            "duplicate_titles": duplicates,
+            "stale_notes": stale,
+            "missing_metadata": missing_metadata,
+            "broken_asset_links": broken,
+            "schema_violations": violations,
+        },
+        "recommendations": recommendations,
+    }
+
+
 async def http_health(request):
     try:
-        for d in [INBOX_DIR, CAPTURE_DIR, KNOWLEDGE_DIR, ASSETS_DIR, ARCHIVE_DIR, VERSIONS_DIR, DELETED_DIR]:
+        for d in [INBOX_DIR, CAPTURE_DIR, KNOWLEDGE_DIR, SOURCES_DIR, TEMPLATES_DIR, SCHEMAS_DIR, INDEXES_DIR, CONTEXT_PACKS_DIR, ASSETS_DIR, ARCHIVE_DIR, VERSIONS_DIR, DELETED_DIR]:
             d.mkdir(parents=True, exist_ok=True)
 
         ok = True
@@ -1195,6 +1739,9 @@ async def http_health(request):
             "vault_root": str(VAULT_ROOT),
             "inbox": str(INBOX_DIR),
             "knowledge": str(KNOWLEDGE_DIR),
+            "schemas": str(SCHEMAS_DIR),
+            "indexes": str(INDEXES_DIR),
+            "context_packs": str(CONTEXT_PACKS_DIR),
             "assets": str(ASSETS_DIR),
             "archive": str(ARCHIVE_DIR),
             "versions": str(VERSIONS_DIR),

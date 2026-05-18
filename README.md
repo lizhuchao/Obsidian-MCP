@@ -44,6 +44,21 @@
 - Search and retrieval
   - `search_notes`
   - `fetch_note`
+- Knowledge-base governance
+  - `bootstrap_llm_knowledge_base`
+  - `list_schemas`
+  - `fetch_schema`
+  - `list_context_packs`
+  - `fetch_context_pack`
+  - `validate_note_against_schema`
+  - `generate_indexes`
+  - `update_knowledge_map`
+  - `update_decision_log`
+  - `audit_knowledge_base`
+  - `find_duplicate_notes`
+  - `find_stale_notes`
+  - `find_broken_asset_links`
+  - `find_schema_violations`
 - Source capture and attachments
   - `capture_source_note`
   - `save_attachment_from_url`
@@ -76,7 +91,7 @@ flowchart TD
 - vault 根目录来自 `VAULT_ROOT`，默认 `/vault`
 - 公网 host 来自 `PUBLIC_HOST`
 - 所有业务时间戳统一使用 `Asia/Shanghai`
-- 启动时会确保 `Inbox / Knowledge / Sources / Templates / Assets / Archive` 等目录存在
+- 启动时会确保 `Inbox / Knowledge / Sources / Templates / Schemas / Indexes / Context_Packs / Assets / Archive` 等目录存在
 
 ## Vault Layout
 
@@ -88,6 +103,9 @@ Obsidian/
     ChatGPT_To_Process/
     Capture/
   Knowledge/
+  Schemas/
+  Indexes/
+  Context_Packs/
   Sources/
   Templates/
   Assets/
@@ -107,6 +125,12 @@ Obsidian/
   - 收外部资料、网页摘要、截图型原始来源
 - `Knowledge`
   - 默认检索面，保存已确认的正式知识
+- `Schemas`
+  - 定义 workflow / troubleshooting / decision / concept / prompt / research-note 等知识类型的结构
+- `Indexes`
+  - 给人和 LLM 提供知识地图、工作流索引、决策日志、stale note 入口
+- `Context_Packs`
+  - 给 ChatGPT / Codex / 其他 agent 在执行前加载最小操作上下文
 - `Sources`
   - 保留来源材料和上下文
 - `Templates`
@@ -138,6 +162,15 @@ Obsidian/
 - base64 图片/PDF 用 `save_attachment_base64`
 - 外部资料采集用 `capture_source_note`
 - 图文草稿可直接用 `create_inbox_note_with_attachments`
+
+治理层工作流也已经接进来：
+
+1. `bootstrap_llm_knowledge_base` 初始化 `Schemas/`、`Indexes/`、`Context_Packs/`
+2. `list_schemas` / `fetch_schema` 让 LLM 在写卡片前先读结构
+3. `list_context_packs` / `fetch_context_pack` 让执行前先加载最小上下文
+4. `validate_note_against_schema` 检查 frontmatter 和必填章节
+5. `generate_indexes` / `update_knowledge_map` / `update_decision_log` 自动维护索引
+6. `audit_knowledge_base` 和相关 find 工具定期体检知识库
 
 ## Deployment
 
@@ -199,6 +232,14 @@ docker run --rm -p 8000:8000 \
 1. 把 `build: ./obsidian-mcp-app` 改成 `build: .`
 2. 按它预期的方式，把 `app.py`、`Dockerfile`、`requirements.txt` 放进 `obsidian-mcp-app/` 子目录
 
+如果你采用第二种 NAS 布局，并且使用当前这版 LLM Knowledge Base 实现，`obsidian-mcp-app/` 至少应包含：
+
+- `app.py`
+- `kb_seed.py`
+- `Dockerfile`
+- `requirements.txt`
+- `scripts/`
+
 当前仓库已经把 Tunnel token 改成通过环境变量注入。建议在本地创建 `.env`，不要提交真实值；可以参考 [`.env.example`](./.env.example)。
 
 ## Configuration
@@ -219,13 +260,55 @@ docker run --rm -p 8000:8000 \
 这个项目有几个比较重要的行为边界：
 
 - `search_notes` 默认只查 `Knowledge`
-- `scope` 支持 `Knowledge`、`Sources`、`Templates`、`Inbox`、`All`、`Archive`
+- `scope` 支持 `Knowledge`、`Sources`、`Templates`、`Inbox`、`Schemas`、`Indexes`、`Context_Packs`、`All`、`Archive`
 - `fetch_note` 允许读取受限目录中的 Markdown 文件
 - `update_knowledge_note` / `append_knowledge_note` 写入前会自动归档旧版本
 - `archive_inbox_note` 和 `archive_knowledge_note` 都是软归档，不是物理删除
 - `rollback_knowledge_note` 会先归档当前版，再恢复指定历史版本
 
 这意味着它不是“文件 CRUD server”，而是一个带 lifecycle 约束的 knowledge-base MCP。
+
+## LLM Knowledge Base Layer
+
+这版仓库不再只提供 Inbox / Knowledge / Archive 的基础生命周期，还补上了治理层：
+
+- `Schemas/`
+  - 用 Markdown 定义知识类型、必填 frontmatter、必填章节、晋升/更新/归档规则
+- `Indexes/`
+  - 用自动生成区块维护 knowledge map、workflow index、decision log、stale notes
+- `Context_Packs/`
+  - 为 ChatGPT / Codex / 多 Agent 执行提供最小上下文包
+- `Audit`
+  - 对现有 Knowledge 做非破坏性体检，不直接批量修改
+
+默认内置的 schema 类型包括：
+
+- `troubleshooting`
+- `workflow`
+- `decision`
+- `concept`
+- `prompt`
+- `code-pattern`
+- `research-note`
+- `source`
+
+默认内置的 context pack 包括：
+
+- `obsidian-kb-operating-context`
+- `codex-operating-context`
+- `troubleshooting-context`
+- `writing-context`
+- `mobile-reading-context`
+
+默认内置的 index 文档包括：
+
+- `Indexes/README.md`
+- `Indexes/knowledge-map.md`
+- `Indexes/active-systems.md`
+- `Indexes/workflows.md`
+- `Indexes/decision-log.md`
+- `Indexes/stale-notes.md`
+- `Indexes/mobile-access.md`
 
 ## Example Use Cases
 
@@ -257,6 +340,8 @@ docker run --rm -p 8000:8000 \
 - `/mcp`
   - 由 `FastMCP` 的 streamable HTTP app 处理
 
+`GET /health` 现在还会返回 `schemas`、`indexes`、`context_packs` 等目录状态，方便部署后验收治理层是否就绪。
+
 ## Safety Model and Current Limits
 
 当前实现是一个业务闭环优先的版本，特点是：
@@ -282,12 +367,16 @@ docker run --rm -p 8000:8000 \
 
 - [`app.py`](./app.py)
   - MCP tools、路径约束、生命周期逻辑、HTTP app
+- [`kb_seed.py`](./kb_seed.py)
+  - schema / index / context pack 的 canonical 定义与生成逻辑
 - [`requirements.txt`](./requirements.txt)
   - Python 依赖
 - [`Dockerfile`](./Dockerfile)
-  - 镜像构建方式
+  - 镜像构建方式；当前需要同时拷贝 `app.py`、`kb_seed.py` 和 `scripts/`
 - [`compose.yaml`](./compose.yaml)
   - NAS + cloudflared 部署示例
+- [`scripts/bootstrap_vault_phase1.py`](./scripts/bootstrap_vault_phase1.py)
+  - 对 Vault 执行 Phase 1 初始化的离线入口
 
 ## Summary
 
