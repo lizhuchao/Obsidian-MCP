@@ -74,7 +74,37 @@ DELETED_DIR = (VAULT_ROOT / DELETED_REL).resolve()
 MAX_CONTENT_BYTES = int(os.environ.get("MAX_CONTENT_BYTES", "300000"))
 MAX_ATTACHMENT_BYTES = int(os.environ.get("MAX_ATTACHMENT_BYTES", "15000000"))
 
-APP_VERSION = "2026-08-14-autonomous-knowledge-ingest"
+APP_VERSION = "2026-08-14-autonomous-knowledge-ingest-governance-repair"
+
+# This is deliberately short: MCP hosts may include it in every model context.
+# The complete, inspectable policy is exposed below as both a Resource and a Tool.
+AUTONOMOUS_INGEST_SERVER_INSTRUCTIONS = """This MCP is the shared, durable LLM-Wiki for the user's Obsidian vault. When the user says '总结一下，入库', '总结并归档', or clearly asks to preserve a meaningful conversation, first search relevant Knowledge and Inbox notes, then use ingest_knowledge. Preserve a conversation checkpoint, continue an existing topic when appropriate, keep incomplete or uncertain material as an Inbox incubating note, promote self-contained reliable material to Knowledge, and apply only high-confidence relations. Do not ask the user to select a folder, title, schema, or links when those can be inferred reliably. For the complete policy, read obsidian://agent-contract/autonomous-ingest or call get_agent_contract. Return only a concise ingest receipt after a successful ingest."""
+
+AUTONOMOUS_INGEST_AGENT_CONTRACT = """# Autonomous Obsidian Knowledge Ingest Contract
+
+## Trigger
+
+When the user says “总结一下，入库”, “总结并归档”, or clearly asks to preserve a meaningful conversation, run the autonomous ingest workflow. Do not request a destination folder, note title, schema, or related notes if they can be inferred reliably.
+
+## Workflow
+
+1. Search relevant `Knowledge` and `00_Inbox` notes to find the canonical topic note.
+2. Separate durable facts, decisions, and conclusions from open questions, speculation, and unfinished discussion.
+3. Call `ingest_knowledge`, which always records an append-only conversation checkpoint.
+4. Reuse and update the canonical topic note across days when the topic continues.
+5. Use `lifecycle=knowledge` only for self-contained, reliable, reusable material. Use `incubating` for unfinished material and `review_needed` for conflicts, high-risk claims, or unresolved uncertainty.
+6. Add only high-confidence, justified relations to existing Knowledge notes.
+
+## Storage model
+
+- `Sources` / Capture checkpoint: recoverable evidence of each conversation.
+- `00_Inbox/ChatGPT_To_Process`: an evolving topic note that is incomplete or needs review.
+- `Knowledge`: the canonical, durable, reusable topic note with version history.
+
+## Response
+
+After success, return a concise receipt with lifecycle, topic note path, checkpoint path, and relation count. If an ingest cannot safely proceed, explain the specific missing evidence or conflict; do not fabricate a destination.
+"""
 
 RELATION_TYPES = {
     "explains",
@@ -364,10 +394,23 @@ def embedded_asset_paths(text: str) -> list[str]:
     return re.findall(r"!\[\[([^\]]+)\]\]", text)
 
 
+def without_fenced_code_blocks(text: str) -> str:
+    """Exclude fenced examples so JSON and Markdown samples are not treated as links."""
+    kept: list[str] = []
+    in_fence = False
+    for line in text.splitlines():
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if not in_fence:
+            kept.append(line)
+    return "\n".join(kept)
+
+
 def wiki_link_targets(text: str) -> list[str]:
     """Return Obsidian wiki-link targets, excluding embeds and aliases."""
     targets = []
-    for raw in re.findall(r"(?<!!)\[\[([^\]]+)\]\]", text):
+    for raw in re.findall(r"(?<!!)\[\[([^\]]+)\]\]", without_fenced_code_blocks(text)):
         target = raw.split("|", 1)[0].split("#", 1)[0].split("^", 1)[0].strip()
         if target:
             targets.append(target)
@@ -866,6 +909,7 @@ def archive_current_knowledge_version(path: Path, archive_status: str, reason: s
 
 mcp = FastMCP(
     "obsidian-kb-business",
+    instructions=AUTONOMOUS_INGEST_SERVER_INSTRUCTIONS,
     stateless_http=True,
     json_response=True,
     transport_security=TransportSecuritySettings(
@@ -880,6 +924,23 @@ mcp = FastMCP(
         allowed_origins=["*"],
     ),
 )
+
+
+@mcp.resource("obsidian://agent-contract/autonomous-ingest")
+def autonomous_ingest_agent_contract_resource() -> str:
+    """Complete cross-Agent policy for autonomous LLM-Wiki ingest."""
+    return AUTONOMOUS_INGEST_AGENT_CONTRACT
+
+
+@mcp.tool()
+def get_agent_contract() -> dict[str, Any]:
+    """Read the complete autonomous LLM-Wiki ingest policy for this MCP server."""
+    return {
+        "ok": True,
+        "contract_uri": "obsidian://agent-contract/autonomous-ingest",
+        "server_instruction": AUTONOMOUS_INGEST_SERVER_INSTRUCTIONS,
+        "contract": AUTONOMOUS_INGEST_AGENT_CONTRACT,
+    }
 
 
 @mcp.tool()
@@ -898,6 +959,7 @@ def health_check() -> dict[str, Any]:
         "timezone": "Asia/Shanghai",
         "vault_root": str(VAULT_ROOT),
         "business_flow": [
+            "get_agent_contract",
             "create_inbox_note",
             "create_inbox_note_with_attachments",
             "replace_inbox_note",
@@ -912,6 +974,7 @@ def health_check() -> dict[str, Any]:
             "search_notes",
             "fetch_note",
             "update_knowledge_note",
+            "patch_knowledge_metadata",
             "append_knowledge_note",
             "archive_knowledge_note",
             "list_versions",
@@ -1345,6 +1408,59 @@ def update_knowledge_note(relative_path: str, content: str, reason: str | None =
         "relative_path": str(path.relative_to(VAULT_ROOT)),
         "previous_version": archived["relative_path"],
         "size_bytes": path.stat().st_size,
+    }
+
+
+@mcp.tool()
+def patch_knowledge_metadata(
+    relative_path: str,
+    note_type: str | None = None,
+    tags: list[str] | None = None,
+    confidence: str | None = None,
+    owner: str | None = None,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    """Patch Knowledge frontmatter without rewriting the note body; archives the old version."""
+    path = normalize_knowledge_path(relative_path)
+    if not path.exists():
+        raise FileNotFoundError("Knowledge note not found")
+    if note_type is None and tags is None and confidence is None and owner is None:
+        raise ValueError("Provide at least one metadata field to patch")
+
+    old_text = read_text_file(path)
+    updates: dict[str, str] = {}
+    if note_type is not None:
+        updates["type"] = normalize_schema_name(note_type)
+    if tags is not None:
+        updates["tags"] = f"[{', '.join(normalize_ingest_tags(tags, note_type))}]"
+    if confidence is not None:
+        if confidence not in {"verified", "inferred", "proposed", "needs_review"}:
+            raise ValueError("Unsupported confidence")
+        updates["confidence"] = confidence
+    if owner is not None:
+        clean_owner = owner.strip()
+        if not clean_owner:
+            raise ValueError("owner cannot be empty")
+        updates["owner"] = clean_owner
+
+    updates.setdefault("created_at", frontmatter_value(old_text, "created_at") or now_iso())
+    updates["status"] = "verified"
+    updates["version"] = str(next_version_number(old_text))
+    updates["updated_at"] = now_iso()
+
+    archived = archive_current_knowledge_version(
+        path,
+        archive_status="superseded",
+        reason=reason or "patch knowledge metadata",
+    )
+    updates["previous_version"] = archived["relative_path"]
+    write_text_file(path, set_frontmatter(old_text, updates))
+    return {
+        "ok": True,
+        "action": "patched_knowledge_metadata",
+        "relative_path": str(path.relative_to(VAULT_ROOT)),
+        "updated_fields": sorted(updates),
+        "previous_version": archived["relative_path"],
     }
 
 
@@ -1866,9 +1982,10 @@ def ingest_frontmatter(
     lifecycle: str,
     checkpoint_path: str,
     schema_name: str | None = None,
+    tags: list[str] | None = None,
     existing_content: str | None = None,
 ) -> str:
-    """Stamp the minimum provenance needed by an autonomous ingest."""
+    """Stamp provenance and the baseline metadata required by Knowledge schemas."""
     checkpoints: list[str] = []
     if existing_content:
         try:
@@ -1879,14 +1996,39 @@ def ingest_frontmatter(
             pass
     if checkpoint_path not in checkpoints:
         checkpoints.append(checkpoint_path)
+    metadata_source = existing_content or content
+    normalized_tags = normalize_ingest_tags(tags, schema_name)
     updates = {
         "topic": topic,
         "knowledge_lifecycle": lifecycle,
         "source_checkpoints": json.dumps(checkpoints, ensure_ascii=False),
+        "created_at": frontmatter_value(metadata_source, "created_at") or now_iso(),
+        "updated_at": now_iso(),
+        "tags": f"[{', '.join(normalized_tags)}]",
+        "confidence": frontmatter_value(metadata_source, "confidence") or (
+            "verified" if lifecycle == "knowledge" else "proposed"
+        ),
+        "owner": frontmatter_value(metadata_source, "owner") or "user",
     }
     if schema_name:
         updates["type"] = schema_name
     return set_frontmatter(content, updates)
+
+
+def normalize_ingest_tags(tags: list[str] | None, schema_name: str | None) -> list[str]:
+    """Return a compact, YAML-inline tag list safe for autonomous ingest."""
+    candidates = list(tags or [])
+    if schema_name:
+        candidates.insert(0, schema_name)
+    candidates.append("autonomous-ingest")
+
+    normalized: list[str] = []
+    for value in candidates:
+        clean = re.sub(r"[\[\],\n\r]+", " ", str(value)).strip()
+        clean = re.sub(r"\s+", "-", clean)
+        if clean and clean not in normalized:
+            normalized.append(clean[:64])
+    return normalized or ["autonomous-ingest"]
 
 
 def default_knowledge_subdir(schema_name: str) -> str:
@@ -1952,6 +2094,7 @@ def ingest_knowledge(
     schema_name: str | None = None,
     topic_note_path: str | None = None,
     knowledge_subdir: str | None = None,
+    tags: list[str] | None = None,
     relations: list[dict[str, Any]] | None = None,
     session_id: str | None = None,
     source_url: str | None = None,
@@ -1960,7 +2103,7 @@ def ingest_knowledge(
     Complete the controlled storage half of an autonomous LLM-Wiki ingest.
 
     The calling Agent supplies the semantic synthesis, lifecycle decision, and
-    any explicit relations after it has searched relevant Inbox and Knowledge
+    any explicit tags and relations after it has searched relevant Inbox and Knowledge
     notes. This tool persists a source checkpoint, updates the selected ongoing
     topic note or creates one, promotes mature content automatically, applies
     validated relations, and preserves Knowledge versions on every update.
@@ -2008,6 +2151,7 @@ def ingest_knowledge(
         lifecycle=lifecycle_key,
         checkpoint_path=checkpoint_path,
         schema_name=normalized_schema,
+        tags=tags,
         existing_content=existing_content,
     )
 

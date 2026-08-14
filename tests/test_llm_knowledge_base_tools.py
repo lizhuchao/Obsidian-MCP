@@ -30,6 +30,11 @@ def install_dependency_stubs():
                 return func
             return decorator
 
+        def resource(self, *args, **kwargs):
+            def decorator(func):
+                return func
+            return decorator
+
         def streamable_http_app(self):
             return object()
 
@@ -131,6 +136,66 @@ def loaded_app():
 
 
 class LlmKnowledgeBaseToolsTests(unittest.TestCase):
+    def test_server_exposes_connection_instructions_and_agent_contract(self):
+        with loaded_app() as (app, _vault_root):
+            self.assertIn("ingest_knowledge", app.mcp.kwargs["instructions"])
+            self.assertIn("obsidian://agent-contract/autonomous-ingest", app.mcp.kwargs["instructions"])
+
+            tool_contract = app.get_agent_contract()
+            resource_contract = app.autonomous_ingest_agent_contract_resource()
+            self.assertEqual(tool_contract["contract"], resource_contract)
+            self.assertIn("## Workflow", resource_contract)
+
+    def test_ingest_frontmatter_adds_schema_metadata_and_preserves_creation_time(self):
+        with loaded_app() as (app, _vault_root):
+            original = "---\ncreated_at: 2026-01-01T00:00:00+08:00\nconfidence: inferred\n---\n\n# Test\n"
+            stamped = app.ingest_frontmatter(
+                original,
+                topic="自动入库测试",
+                lifecycle="knowledge",
+                checkpoint_path="00_Inbox/Capture/test.md",
+                schema_name="workflow",
+                tags=["obsidian", "LLM Wiki"],
+            )
+            meta = app.frontmatter_map(stamped)
+            self.assertEqual(meta["created_at"], "2026-01-01T00:00:00+08:00")
+            self.assertEqual(meta["confidence"], "inferred")
+            self.assertEqual(meta["owner"], "user")
+            self.assertEqual(meta["tags"], "[workflow, obsidian, LLM-Wiki, autonomous-ingest]")
+            self.assertTrue(meta["updated_at"])
+
+    def test_wiki_link_parser_ignores_fenced_code_examples(self):
+        with loaded_app() as (app, _vault_root):
+            text = """# Links
+
+[[Knowledge/Concepts/Real]]
+
+```json
+{"value": [[906, 488]]}
+[[Knowledge/Missing Example]]
+```
+"""
+            self.assertEqual(app.wiki_link_targets(text), ["Knowledge/Concepts/Real"])
+
+    def test_patch_knowledge_metadata_preserves_body_and_archives_version(self):
+        with loaded_app() as (app, vault_root):
+            path = vault_root / "Knowledge" / "Projects" / "example.md"
+            body = "# Example\n\n## 原有正文\n\n必须保留。\n"
+            app.write_text_file(path, body)
+            result = app.patch_knowledge_metadata(
+                "Knowledge/Projects/example.md",
+                note_type="code-pattern",
+                tags=["project", "debug"],
+                confidence="verified",
+                owner="user",
+            )
+            updated = app.read_text_file(path)
+            self.assertEqual(result["action"], "patched_knowledge_metadata")
+            self.assertIn("type: code-pattern", updated)
+            self.assertIn("tags: [code-pattern, project, debug, autonomous-ingest]", updated)
+            self.assertIn(body.strip(), updated)
+            self.assertTrue((vault_root / result["previous_version"]).exists())
+
     def test_relation_tools_preview_apply_list_remove_and_broken_links(self):
         with loaded_app() as (app, vault_root):
             source_path = vault_root / "Knowledge" / "Plans" / "source.md"
