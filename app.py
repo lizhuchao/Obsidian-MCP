@@ -1,4 +1,5 @@
 import base64
+import json
 import contextlib
 import mimetypes
 import os
@@ -73,7 +74,23 @@ DELETED_DIR = (VAULT_ROOT / DELETED_REL).resolve()
 MAX_CONTENT_BYTES = int(os.environ.get("MAX_CONTENT_BYTES", "300000"))
 MAX_ATTACHMENT_BYTES = int(os.environ.get("MAX_ATTACHMENT_BYTES", "15000000"))
 
-APP_VERSION = "2026-05-17-llm-knowledge-base-bootstrap-schema-index-context-audit"
+APP_VERSION = "2026-08-14-autonomous-knowledge-ingest"
+
+RELATION_TYPES = {
+    "explains",
+    "implements",
+    "depends_on",
+    "derived_from",
+    "contradicts",
+    "supersedes",
+    "related_to",
+}
+RELATION_CONFIDENCES = {"high", "medium", "low", "needs_review"}
+AI_RELATIONS_HEADING = "## AI 关联（自动维护）"
+AI_RELATIONS_START = "<!-- AI_RELATIONS_START -->"
+AI_RELATIONS_END = "<!-- AI_RELATIONS_END -->"
+MAX_RELATIONS_PER_APPLY = 20
+AUTONOMOUS_INGEST_LIFECYCLES = {"incubating", "knowledge", "review_needed"}
 
 
 def now_local() -> str:
@@ -345,6 +362,195 @@ def validate_note_text(text: str, schema_name: str) -> dict[str, Any]:
 
 def embedded_asset_paths(text: str) -> list[str]:
     return re.findall(r"!\[\[([^\]]+)\]\]", text)
+
+
+def wiki_link_targets(text: str) -> list[str]:
+    """Return Obsidian wiki-link targets, excluding embeds and aliases."""
+    targets = []
+    for raw in re.findall(r"(?<!!)\[\[([^\]]+)\]\]", text):
+        target = raw.split("|", 1)[0].split("#", 1)[0].split("^", 1)[0].strip()
+        if target:
+            targets.append(target)
+    return targets
+
+
+def resolve_wiki_link_target(target: str) -> Path | None:
+    """Resolve a vault-relative wiki link without allowing path traversal."""
+    clean = target.strip().lstrip("/")
+    if not clean or clean.startswith("."):
+        return None
+
+    candidates = [clean]
+    if not clean.endswith(".md"):
+        candidates.append(f"{clean}.md")
+
+    for candidate_raw in candidates:
+        candidate = (VAULT_ROOT / candidate_raw).resolve()
+        try:
+            ensure_inside(candidate, VAULT_ROOT)
+        except ValueError:
+            return None
+        if candidate.exists() and candidate.suffix == ".md":
+            return candidate
+
+    # Obsidian also permits title-only links. Resolve only an unambiguous title.
+    if "/" not in clean:
+        matches = []
+        for path in all_markdown_files(KNOWLEDGE_DIR):
+            try:
+                if path.stem == clean or title_from_markdown(path, read_text_file(path)) == clean:
+                    matches.append(path)
+            except Exception:
+                continue
+        if len(matches) == 1:
+            return matches[0]
+    return None
+
+
+def relation_metadata(text: str) -> list[dict[str, str]]:
+    """Read JSON-in-YAML relation metadata, tolerating older or malformed notes."""
+    raw = frontmatter_value(text, "relations")
+    if not raw:
+        return []
+    try:
+        import json
+        parsed = json.loads(raw)
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+
+    result = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        target = item.get("target")
+        relation_type = item.get("type")
+        if isinstance(target, str) and isinstance(relation_type, str):
+            result.append({
+                "target": target,
+                "type": relation_type,
+                "confidence": str(item.get("confidence") or "needs_review"),
+                "rationale": str(item.get("rationale") or ""),
+            })
+    return result
+
+
+def normalize_relation(relative_path: str, item: dict[str, Any]) -> dict[str, str]:
+    if not isinstance(item, dict):
+        raise ValueError("Each relation must be an object")
+    target = str(item.get("target") or "").strip().lstrip("/")
+    relation_type = str(item.get("type") or "").strip()
+    confidence = str(item.get("confidence") or "needs_review").strip()
+    rationale = str(item.get("rationale") or "").strip()
+
+    if relation_type not in RELATION_TYPES:
+        raise ValueError(f"Unsupported relation type: {relation_type}")
+    if confidence not in RELATION_CONFIDENCES:
+        raise ValueError(f"Unsupported relation confidence: {confidence}")
+    if not rationale:
+        raise ValueError("relation rationale is required")
+    if len(rationale) > 500:
+        raise ValueError("relation rationale is too long; max 500 characters")
+
+    target_path = normalize_knowledge_path(target)
+    if not target_path.exists():
+        raise FileNotFoundError(f"Relation target not found: {target}")
+    normalized_target = str(target_path.relative_to(VAULT_ROOT))
+    if normalized_target == relative_path:
+        raise ValueError("A note cannot relate to itself")
+
+    return {
+        "target": normalized_target,
+        "type": relation_type,
+        "confidence": confidence,
+        "rationale": rationale,
+    }
+
+
+def render_ai_relations_block(relations: list[dict[str, str]]) -> str:
+    lines = [AI_RELATIONS_HEADING, "", AI_RELATIONS_START, ""]
+    if relations:
+        for item in relations:
+            target = item["target"]
+            target_path = (VAULT_ROOT / target).resolve()
+            target_title = target_path.stem
+            if target_path.exists():
+                target_title = title_from_markdown(target_path, read_text_file(target_path))
+            lines.append(
+                f"- [[{target}|{target_title}]] — `{item['type']}` / "
+                f"`{item['confidence']}`：{item['rationale']}"
+            )
+    else:
+        lines.append("- 暂无 AI 维护的关联")
+    lines += ["", AI_RELATIONS_END]
+    return "\n".join(lines)
+
+
+def replace_ai_relations_block(text: str, relations: list[dict[str, str]]) -> str:
+    block = render_ai_relations_block(relations)
+    pattern = re.escape(AI_RELATIONS_HEADING) + r".*?" + re.escape(AI_RELATIONS_END)
+    if re.search(pattern, text, flags=re.DOTALL):
+        return re.sub(pattern, block, text, count=1, flags=re.DOTALL).rstrip() + "\n"
+    return text.rstrip() + "\n\n" + block + "\n"
+
+
+def relation_key(item: dict[str, str]) -> tuple[str, str]:
+    return item["target"], item["type"]
+
+
+def merge_relations(existing: list[dict[str, str]], incoming: list[dict[str, str]]) -> list[dict[str, str]]:
+    merged = {relation_key(item): item for item in existing}
+    for item in incoming:
+        merged[relation_key(item)] = item
+    return sorted(merged.values(), key=lambda item: (item["target"], item["type"]))
+
+
+def relationship_candidates(path: Path, limit: int) -> list[dict[str, Any]]:
+    """Deterministic candidate recall. A calling AI makes the semantic decision."""
+    text = read_text_file(path)
+    title = title_from_markdown(path, text)
+    source_terms = set(re.findall(r"[\w\-]{2,}", title.lower()))
+    source_terms.update(re.findall(r"[\w\-]{2,}", (frontmatter_value(text, "tags") or "").lower()))
+    source_terms.discard("knowledge")
+    existing_targets = {item["target"] for item in relation_metadata(text)}
+    results = []
+    for record in collect_knowledge_note_records():
+        if record["relative_path"] == str(path.relative_to(VAULT_ROOT)):
+            continue
+        if record["relative_path"] in existing_targets:
+            continue
+        candidate_terms = set(re.findall(r"[\w\-]{2,}", (record["title"] + " " + (record.get("tags") or "")).lower()))
+        shared = sorted(source_terms & candidate_terms)
+        if not shared:
+            continue
+        results.append({
+            "target": record["relative_path"],
+            "title": record["title"],
+            "score": len(shared),
+            "matched_terms": shared,
+            "snippet": snippet(record["content"], shared),
+            "suggested_relation": {
+                "type": "related_to",
+                "confidence": "needs_review",
+                "rationale": f"候选召回命中：{', '.join(shared)}。需要 AI 或人工复核关系类型与理由。",
+            },
+        })
+    results.sort(key=lambda item: (item["score"], item["title"]), reverse=True)
+    return results[:limit]
+
+
+def broken_note_links(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    broken = []
+    for record in records:
+        for target in sorted(set(wiki_link_targets(record["content"]))):
+            if resolve_wiki_link_target(target) is None:
+                broken.append({
+                    "relative_path": record["relative_path"],
+                    "title": record["title"],
+                    "missing_note": target,
+                })
+    return broken
 
 
 def ensure_support_docs_exist(note_records: list[dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -699,6 +905,8 @@ def health_check() -> dict[str, Any]:
             "archive_inbox_note",
             "save_attachment_from_url",
             "save_attachment_base64",
+            "checkpoint_conversation",
+            "ingest_knowledge",
             "fetch_inbox_note",
             "promote_inbox_note",
             "search_notes",
@@ -722,6 +930,11 @@ def health_check() -> dict[str, Any]:
             "find_duplicate_notes",
             "find_stale_notes",
             "find_broken_asset_links",
+            "list_note_relations",
+            "suggest_note_relations",
+            "apply_note_relations",
+            "remove_note_relation",
+            "find_broken_note_links",
             "find_schema_violations",
         ],
         "write_allowed": [
@@ -1308,6 +1521,188 @@ def fetch_note(relative_path: str) -> dict[str, Any]:
 
 
 @mcp.tool()
+def list_note_relations(relative_path: str) -> dict[str, Any]:
+    """List explicit AI-managed outgoing relations and incoming Obsidian links."""
+    path = normalize_knowledge_path(relative_path)
+    if not path.exists():
+        raise FileNotFoundError("Knowledge note not found")
+
+    relative = str(path.relative_to(VAULT_ROOT))
+    text = read_text_file(path)
+    outgoing = relation_metadata(text)
+    incoming = []
+    for record in collect_knowledge_note_records():
+        if record["relative_path"] == relative:
+            continue
+        explicit = [item for item in relation_metadata(record["content"]) if item["target"] == relative]
+        wiki_targets = wiki_link_targets(record["content"])
+        if explicit or any(resolve_wiki_link_target(target) == path for target in wiki_targets):
+            incoming.append({
+                "relative_path": record["relative_path"],
+                "title": record["title"],
+                "explicit_relations": explicit,
+            })
+
+    return {
+        "ok": True,
+        "relative_path": relative,
+        "outgoing_relations": outgoing,
+        "incoming_links": sorted(incoming, key=lambda item: item["relative_path"]),
+        "wiki_link_targets": sorted(set(wiki_link_targets(text))),
+    }
+
+
+@mcp.tool()
+def suggest_note_relations(relative_path: str, limit: int = 10) -> dict[str, Any]:
+    """
+    Return deterministic candidate notes for a caller/AI to review. This tool never
+    writes relations and does not claim that a candidate is semantically correct.
+    """
+    path = normalize_knowledge_path(relative_path)
+    if not path.exists():
+        raise FileNotFoundError("Knowledge note not found")
+    limit = max(1, min(limit, 20))
+    return {
+        "ok": True,
+        "relative_path": str(path.relative_to(VAULT_ROOT)),
+        "candidates": relationship_candidates(path, limit),
+        "next_action": "Review candidates, then call apply_note_relations with explicit type, confidence, and rationale.",
+    }
+
+
+@mcp.tool()
+def apply_note_relations(
+    relative_path: str,
+    relations: list[dict[str, Any]],
+    apply: bool = False,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    """
+    Add or update explicit note relations. Defaults to dry-run; set apply=true only
+    after reviewing the returned change. Existing manual prose is never modified.
+    """
+    path = normalize_knowledge_path(relative_path)
+    if not path.exists():
+        raise FileNotFoundError("Knowledge note not found")
+    if len(relations) > MAX_RELATIONS_PER_APPLY:
+        raise ValueError(f"Too many relations; max {MAX_RELATIONS_PER_APPLY} per apply")
+
+    relative = str(path.relative_to(VAULT_ROOT))
+    incoming = [normalize_relation(relative, item) for item in relations]
+    if len({relation_key(item) for item in incoming}) != len(incoming):
+        raise ValueError("Duplicate target/type pairs are not allowed")
+
+    old_text = read_text_file(path)
+    merged = merge_relations(relation_metadata(old_text), incoming)
+    import json
+    proposed = set_frontmatter(
+        replace_ai_relations_block(old_text, merged),
+        {
+            "relations": json.dumps(merged, ensure_ascii=False, separators=(",", ":")),
+            "relation_checked_at": now_iso(),
+        },
+    )
+
+    result = {
+        "ok": True,
+        "action": "applied_note_relations" if apply else "preview_note_relations",
+        "relative_path": relative,
+        "relations": merged,
+        "added_or_updated": incoming,
+        "changed": proposed != old_text,
+        "dry_run": not apply,
+    }
+    if not apply:
+        result["preview"] = proposed
+        return result
+
+    if proposed != old_text:
+        archived = archive_current_knowledge_version(
+            path,
+            archive_status="superseded",
+            reason=reason or "update note relations",
+        )
+        new_text = set_frontmatter(
+            proposed,
+            {
+                "status": "verified",
+                "version": str(next_version_number(old_text)),
+                "updated_at": now_iso(),
+                "previous_version": archived["relative_path"],
+            },
+        )
+        write_text_file(path, new_text)
+        result["previous_version"] = archived["relative_path"]
+    return result
+
+
+@mcp.tool()
+def remove_note_relation(
+    relative_path: str,
+    target: str,
+    relation_type: str | None = None,
+    apply: bool = False,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    """Remove one explicit relation, or all relation types for one target; dry-run by default."""
+    path = normalize_knowledge_path(relative_path)
+    if not path.exists():
+        raise FileNotFoundError("Knowledge note not found")
+    target_path = normalize_knowledge_path(target)
+    normalized_target = str(target_path.relative_to(VAULT_ROOT))
+    if relation_type is not None and relation_type not in RELATION_TYPES:
+        raise ValueError(f"Unsupported relation type: {relation_type}")
+
+    old_text = read_text_file(path)
+    old_relations = relation_metadata(old_text)
+    remaining = [
+        item for item in old_relations
+        if not (item["target"] == normalized_target and (relation_type is None or item["type"] == relation_type))
+    ]
+    if len(remaining) == len(old_relations):
+        raise ValueError("Matching relation not found")
+
+    import json
+    proposed = set_frontmatter(
+        replace_ai_relations_block(old_text, remaining),
+        {
+            "relations": json.dumps(remaining, ensure_ascii=False, separators=(",", ":")),
+            "relation_checked_at": now_iso(),
+        },
+    )
+    result = {
+        "ok": True,
+        "action": "removed_note_relation" if apply else "preview_remove_note_relation",
+        "relative_path": str(path.relative_to(VAULT_ROOT)),
+        "removed_target": normalized_target,
+        "removed_relation_type": relation_type,
+        "relations": remaining,
+        "dry_run": not apply,
+    }
+    if not apply:
+        result["preview"] = proposed
+        return result
+
+    archived = archive_current_knowledge_version(
+        path,
+        archive_status="superseded",
+        reason=reason or "remove note relation",
+    )
+    new_text = set_frontmatter(
+        proposed,
+        {
+            "status": "verified",
+            "version": str(next_version_number(old_text)),
+            "updated_at": now_iso(),
+            "previous_version": archived["relative_path"],
+        },
+    )
+    write_text_file(path, new_text)
+    result["previous_version"] = archived["relative_path"]
+    return result
+
+
+@mcp.tool()
 def list_versions(relative_path: str, include_deleted: bool = True) -> list[dict[str, Any]]:
     """
     List archived versions for a Knowledge note.
@@ -1461,6 +1856,232 @@ def capture_source_note(
         "ok": True,
         "action": "captured_source",
         "relative_path": str(target.relative_to(VAULT_ROOT)),
+    }
+
+
+def ingest_frontmatter(
+    content: str,
+    *,
+    topic: str,
+    lifecycle: str,
+    checkpoint_path: str,
+    schema_name: str | None = None,
+    existing_content: str | None = None,
+) -> str:
+    """Stamp the minimum provenance needed by an autonomous ingest."""
+    checkpoints: list[str] = []
+    if existing_content:
+        try:
+            previous = json.loads(frontmatter_value(existing_content, "source_checkpoints") or "[]")
+            if isinstance(previous, list):
+                checkpoints = [str(item) for item in previous if isinstance(item, str) and item]
+        except (TypeError, ValueError):
+            pass
+    if checkpoint_path not in checkpoints:
+        checkpoints.append(checkpoint_path)
+    updates = {
+        "topic": topic,
+        "knowledge_lifecycle": lifecycle,
+        "source_checkpoints": json.dumps(checkpoints, ensure_ascii=False),
+    }
+    if schema_name:
+        updates["type"] = schema_name
+    return set_frontmatter(content, updates)
+
+
+def default_knowledge_subdir(schema_name: str) -> str:
+    """Return a Knowledge-relative destination for one of the canonical schemas."""
+    default_directory = str(SCHEMA_SPECS[normalize_schema_name(schema_name)]["default_directory"])
+    if not default_directory.startswith(f"{KNOWLEDGE_REL}/"):
+        raise ValueError(f"Schema default directory must be under {KNOWLEDGE_REL}: {default_directory}")
+    return default_directory[len(KNOWLEDGE_REL) + 1:]
+
+
+@mcp.tool()
+def checkpoint_conversation(
+    topic: str,
+    content: str,
+    session_id: str | None = None,
+    source_url: str | None = None,
+) -> dict[str, Any]:
+    """
+    Persist an append-only conversation checkpoint before context compaction or a
+    topic shift. Agents should call this automatically during long, meaningful
+    conversations; it never creates or changes a formal Knowledge note.
+    """
+    clean_topic = topic.strip()
+    if not clean_topic:
+        raise ValueError("topic is required")
+    if not content.strip():
+        raise ValueError("content is required")
+
+    checkpoint = capture_source_note(
+        title=f"{clean_topic} — conversation checkpoint",
+        source_type="conversation-checkpoint",
+        content=content,
+        url=source_url,
+    )
+    path = normalize_read_path(checkpoint["relative_path"])
+    text = read_text_file(path)
+    text = set_frontmatter(
+        text,
+        {
+            "status": "captured",
+            "topic": clean_topic,
+            "session_id": session_id or "",
+            "checkpoint_at": now_iso(),
+            "append_only": "true",
+        },
+    )
+    write_text_file(path, text)
+    return {
+        **checkpoint,
+        "action": "checkpointed_conversation",
+        "topic": clean_topic,
+        "session_id": session_id,
+        "lifecycle": "source",
+    }
+
+
+@mcp.tool()
+def ingest_knowledge(
+    topic: str,
+    session_content: str,
+    distilled_content: str,
+    lifecycle: str = "incubating",
+    schema_name: str | None = None,
+    topic_note_path: str | None = None,
+    knowledge_subdir: str | None = None,
+    relations: list[dict[str, Any]] | None = None,
+    session_id: str | None = None,
+    source_url: str | None = None,
+) -> dict[str, Any]:
+    """
+    Complete the controlled storage half of an autonomous LLM-Wiki ingest.
+
+    The calling Agent supplies the semantic synthesis, lifecycle decision, and
+    any explicit relations after it has searched relevant Inbox and Knowledge
+    notes. This tool persists a source checkpoint, updates the selected ongoing
+    topic note or creates one, promotes mature content automatically, applies
+    validated relations, and preserves Knowledge versions on every update.
+
+    Use when a user says “总结一下，入库” or an equivalent request. Do not ask
+    the user to select a folder or note when the Agent can infer it reliably.
+    """
+    clean_topic = topic.strip()
+    if not clean_topic:
+        raise ValueError("topic is required")
+    if not session_content.strip():
+        raise ValueError("session_content is required")
+    if not distilled_content.strip():
+        raise ValueError("distilled_content is required")
+
+    lifecycle_key = lifecycle.strip().lower()
+    if lifecycle_key not in AUTONOMOUS_INGEST_LIFECYCLES:
+        raise ValueError(f"Unsupported lifecycle: {lifecycle}")
+
+    if lifecycle_key == "knowledge" and not schema_name:
+        raise ValueError("schema_name is required when lifecycle is knowledge")
+    normalized_schema = normalize_schema_name(schema_name) if schema_name else None
+
+    existing_content = None
+    if topic_note_path:
+        existing_path = (
+            normalize_knowledge_path(topic_note_path)
+            if lifecycle_key == "knowledge"
+            else normalize_inbox_path(topic_note_path)
+        )
+        if not existing_path.exists():
+            raise FileNotFoundError("topic_note_path not found in the selected lifecycle area")
+        existing_content = read_text_file(existing_path)
+
+    checkpoint = checkpoint_conversation(
+        topic=clean_topic,
+        content=session_content,
+        session_id=session_id,
+        source_url=source_url,
+    )
+    checkpoint_path = checkpoint["relative_path"]
+    content = ingest_frontmatter(
+        distilled_content,
+        topic=clean_topic,
+        lifecycle=lifecycle_key,
+        checkpoint_path=checkpoint_path,
+        schema_name=normalized_schema,
+        existing_content=existing_content,
+    )
+
+    relation_items = relations or []
+    if lifecycle_key in {"incubating", "review_needed"}:
+        status = "review-needed" if lifecycle_key == "review_needed" else "incubating"
+        content = set_frontmatter(content, {"status": status, "updated_at": now_iso()})
+
+        if topic_note_path:
+            target = normalize_inbox_path(topic_note_path)
+            if not target.exists():
+                raise FileNotFoundError("topic_note_path Inbox note not found")
+            old_text = read_text_file(target)
+            write_text_file(target, content)
+            result = {
+                "ok": True,
+                "action": "updated_incubating_topic",
+                "relative_path": str(target.relative_to(VAULT_ROOT)),
+                "replaced_size_bytes": len(old_text.encode("utf-8")),
+            }
+        else:
+            created = create_inbox_note(title=clean_topic, content=content)
+            result = {
+                "ok": True,
+                "action": "created_incubating_topic",
+                "relative_path": created["relative_path"],
+            }
+
+        return {
+            **result,
+            "checkpoint": checkpoint_path,
+            "lifecycle": lifecycle_key,
+            "relations_applied": [],
+            "next_action": "Continue this same topic note on later sessions; promote automatically once it is self-contained and reliable.",
+        }
+
+    if topic_note_path:
+        target = normalize_knowledge_path(topic_note_path)
+        if not target.exists():
+            raise FileNotFoundError("topic_note_path Knowledge note not found")
+        updated = update_knowledge_note(
+            relative_path=str(target.relative_to(VAULT_ROOT)),
+            content=content,
+            reason="autonomous knowledge ingest",
+        )
+        knowledge_path = updated["relative_path"]
+        result = {**updated, "action": "updated_knowledge_topic"}
+    else:
+        subdir = (knowledge_subdir or default_knowledge_subdir(normalized_schema)).strip().strip("/")
+        created = create_inbox_note(title=clean_topic, content=content)
+        promoted = promote_inbox_note(
+            path_or_filename=created["relative_path"],
+            knowledge_subdir=subdir,
+            final_title=clean_topic,
+        )
+        knowledge_path = promoted["to"]
+        result = {**promoted, "action": "created_knowledge_topic"}
+
+    applied_relations: list[dict[str, str]] = []
+    if relation_items:
+        relation_result = apply_note_relations(
+            relative_path=knowledge_path,
+            relations=relation_items,
+            apply=True,
+            reason="autonomous knowledge ingest relations",
+        )
+        applied_relations = relation_result["added_or_updated"]
+
+    return {
+        **result,
+        "ok": True,
+        "checkpoint": checkpoint_path,
+        "lifecycle": "knowledge",
+        "relations_applied": applied_relations,
     }
 
 
@@ -1641,6 +2262,12 @@ def find_broken_asset_links() -> list[dict[str, Any]]:
 
 
 @mcp.tool()
+def find_broken_note_links() -> list[dict[str, Any]]:
+    """Find Obsidian wiki links in Knowledge notes whose target note is missing."""
+    return broken_note_links(collect_knowledge_note_records())
+
+
+@mcp.tool()
 def find_schema_violations() -> list[dict[str, Any]]:
     """Find Knowledge notes missing schema-required metadata or sections."""
     return schema_violations(collect_knowledge_note_records())
@@ -1656,6 +2283,7 @@ def audit_knowledge_base(stale_days: int = 180, inbox_backlog_threshold: int = 2
     duplicates = duplicate_note_titles(records)
     stale = stale_note_records(records)
     broken = broken_asset_links(records)
+    broken_notes = broken_note_links(records)
     violations = schema_violations(records)
     missing_metadata = [
         {
@@ -1687,6 +2315,8 @@ def audit_knowledge_base(stale_days: int = 180, inbox_backlog_threshold: int = 2
         recommendations.append("复查长期未更新但仍是 verified 的知识卡。")
     if broken:
         recommendations.append("补齐丢失的 Assets 或修复嵌入链接。")
+    if broken_notes:
+        recommendations.append("修复指向不存在 Markdown 笔记的 Obsidian 双链。")
     if violations or missing_metadata:
         recommendations.append("按 schema 补齐 frontmatter 和必填章节。")
     if not recommendations:
@@ -1701,6 +2331,7 @@ def audit_knowledge_base(stale_days: int = 180, inbox_backlog_threshold: int = 2
             "stale_note_count": len(stale),
             "missing_metadata_count": len(missing_metadata),
             "broken_asset_link_count": len(broken),
+            "broken_note_link_count": len(broken_notes),
             "schema_violation_count": len(violations),
             "rollback_audit_supported": True,
         },
@@ -1711,6 +2342,7 @@ def audit_knowledge_base(stale_days: int = 180, inbox_backlog_threshold: int = 2
             "stale_notes": stale,
             "missing_metadata": missing_metadata,
             "broken_asset_links": broken,
+            "broken_note_links": broken_notes,
             "schema_violations": violations,
         },
         "recommendations": recommendations,

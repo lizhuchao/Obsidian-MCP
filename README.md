@@ -33,6 +33,9 @@
   - `replace_inbox_note`
   - `append_inbox_note`
   - `archive_inbox_note`
+- Autonomous knowledge ingest
+  - `checkpoint_conversation`
+  - `ingest_knowledge`
 - Knowledge lifecycle
   - `promote_inbox_note`
   - `update_knowledge_note`
@@ -58,6 +61,11 @@
   - `find_duplicate_notes`
   - `find_stale_notes`
   - `find_broken_asset_links`
+  - `list_note_relations`
+  - `suggest_note_relations`
+  - `apply_note_relations`
+  - `remove_note_relation`
+  - `find_broken_note_links`
   - `find_schema_violations`
 - Source capture and attachments
   - `capture_source_note`
@@ -171,6 +179,29 @@ Obsidian/
 4. `validate_note_against_schema` 检查 frontmatter 和必填章节
 5. `generate_indexes` / `update_knowledge_map` / `update_decision_log` 自动维护索引
 6. `audit_knowledge_base` 和相关 find 工具定期体检知识库
+
+### AI 关联（Phase 1）
+
+MCP 现在可以将经确认的笔记关系同时保存为 Obsidian 双链和 frontmatter 中的结构化 `relations` 数据。推荐流程：
+
+1. 调用 `suggest_note_relations` 获取候选；它只做轻量召回，不会把候选当作已确认关系。
+2. 调用方的 AI 或用户为候选补充关系类型、置信度和理由。
+3. 先调用 `apply_note_relations`（默认 dry-run）审阅预览，再用 `apply=true` 写入。
+4. 用 `list_note_relations` 获取一跳出链/入链；用 `find_broken_note_links` 做 Markdown 双链体检。
+
+支持的受控关系类型为 `explains`、`implements`、`depends_on`、`derived_from`、`contradicts`、`supersedes`、`related_to`。写入关系会自动归档旧版本，且只维护独立的 `AI 关联（自动维护）` 区块，不覆盖用户手写内容。
+
+### Autonomous Knowledge Ingest
+
+`checkpoint_conversation` 和 `ingest_knowledge` 使调用方 AI 能以受控方式把一段长对话沉淀为可持续演进的主题知识，而不是只保存一次性聊天摘要：
+
+1. `checkpoint_conversation` 将原始对话保存为 append-only 的 `00_Inbox/Capture` 来源记录，用于追溯和后续复核。
+2. `ingest_knowledge` 保存调用方已经提炼过的内容，并记录该知识卡依赖的 checkpoint。
+3. 生命周期为 `incubating` 或 `review_needed` 时，内容仍留在 Inbox，供后续同主题对话持续更新。
+4. 生命周期为 `knowledge` 时，工具会按 schema 创建或更新正式 Knowledge 笔记，并在更新前自动归档旧版本。
+5. 调用方可同时传入经过确认的 `relations`，工具会复用关联写入校验和版本归档机制。
+
+这两个工具不自行调用模型或安排后台任务：AI 负责总结、判断成熟度和关系语义；MCP 负责受限、可追溯、可回滚的持久化。常规的“先写 Inbox、用户确认再 promote”流程仍然保留，适合需要人工审批的场景。
 
 ## Deployment
 

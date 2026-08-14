@@ -1,4 +1,5 @@
 import importlib
+import json
 import os
 import sys
 import tempfile
@@ -130,6 +131,63 @@ def loaded_app():
 
 
 class LlmKnowledgeBaseToolsTests(unittest.TestCase):
+    def test_relation_tools_preview_apply_list_remove_and_broken_links(self):
+        with loaded_app() as (app, vault_root):
+            source_path = vault_root / "Knowledge" / "Plans" / "source.md"
+            target_path = vault_root / "Knowledge" / "Concepts" / "target.md"
+            app.write_text_file(
+                source_path,
+                "---\ntype: concept\nstatus: verified\ntags: [obsidian, mcp]\n---\n\n# Source\n\n手写说明必须保留。\n\n[[Knowledge/Missing]]\n",
+            )
+            app.write_text_file(
+                target_path,
+                "---\ntype: concept\nstatus: verified\ntags: [obsidian]\n---\n\n# Target\n",
+            )
+
+            relation = {
+                "target": "Knowledge/Concepts/target.md",
+                "type": "explains",
+                "confidence": "high",
+                "rationale": "Target defines the concept used by this plan.",
+            }
+            preview = app.apply_note_relations(
+                "Knowledge/Plans/source.md", [relation]
+            )
+            self.assertTrue(preview["dry_run"])
+            self.assertFalse((vault_root / "Archive" / "Versions").exists())
+            self.assertNotIn("AI_RELATIONS_START", app.read_text_file(source_path))
+            self.assertIn("AI 关联（自动维护）", preview["preview"])
+
+            applied = app.apply_note_relations(
+                "Knowledge/Plans/source.md", [relation], apply=True
+            )
+            self.assertFalse(applied["dry_run"])
+            self.assertIn("previous_version", applied)
+            updated = app.read_text_file(source_path)
+            self.assertIn("手写说明必须保留。", updated)
+            self.assertIn("[[Knowledge/Concepts/target.md|Target]]", updated)
+            self.assertIn('"type":"explains"', app.frontmatter_value(updated, "relations"))
+
+            listed = app.list_note_relations("Knowledge/Concepts/target.md")
+            self.assertEqual(listed["incoming_links"][0]["relative_path"], "Knowledge/Plans/source.md")
+
+            broken = app.find_broken_note_links()
+            self.assertEqual(broken[0]["missing_note"], "Knowledge/Missing")
+
+            removed_preview = app.remove_note_relation(
+                "Knowledge/Plans/source.md",
+                "Knowledge/Concepts/target.md",
+                relation_type="explains",
+            )
+            self.assertTrue(removed_preview["dry_run"])
+            removed = app.remove_note_relation(
+                "Knowledge/Plans/source.md",
+                "Knowledge/Concepts/target.md",
+                relation_type="explains",
+                apply=True,
+            )
+            self.assertEqual(removed["relations"], [])
+
     def test_bootstrap_creates_phase_one_docs(self):
         with loaded_app() as (app, vault_root):
             result = app.bootstrap_llm_knowledge_base()
@@ -351,6 +409,68 @@ owner: user
             self.assertGreaterEqual(audit["summary"]["schema_violation_count"], 1)
             self.assertGreaterEqual(audit["summary"]["missing_metadata_count"], 1)
             self.assertEqual(original_missing, missing_path.read_text(encoding="utf-8"))
+
+    def test_checkpoint_and_autonomous_ingest_continue_one_incubating_topic(self):
+        with loaded_app() as (app, vault_root):
+            first = app.ingest_knowledge(
+                topic="跨天知识入库",
+                session_content="第一天：讨论了自动保存尚未完成话题的必要性。",
+                distilled_content="# 跨天知识入库\n\n## 当前结论\n\n第一天仍在讨论。\n",
+                lifecycle="incubating",
+                session_id="session-day-1",
+            )
+
+            self.assertEqual(first["action"], "created_incubating_topic")
+            topic_path = first["relative_path"]
+            checkpoint_one = vault_root / first["checkpoint"]
+            self.assertTrue(checkpoint_one.exists())
+            self.assertIn("session-day-1", app.read_text_file(checkpoint_one))
+
+            second = app.ingest_knowledge(
+                topic="跨天知识入库",
+                session_content="第二天：明确主题成熟后应自动升级为 Knowledge。",
+                distilled_content="# 跨天知识入库\n\n## 当前结论\n\n主题仍在孵化，已经补充第二天的结论。\n",
+                lifecycle="incubating",
+                topic_note_path=topic_path,
+                session_id="session-day-2",
+            )
+
+            self.assertEqual(second["action"], "updated_incubating_topic")
+            self.assertEqual(second["relative_path"], topic_path)
+            topic_text = app.read_text_file(vault_root / topic_path)
+            checkpoints = json.loads(app.frontmatter_value(topic_text, "source_checkpoints"))
+            self.assertEqual(len(checkpoints), 2)
+            self.assertIn("第二天的结论", topic_text)
+
+    def test_autonomous_ingest_promotes_mature_content_and_applies_relations(self):
+        with loaded_app() as (app, vault_root):
+            target_path = vault_root / "Knowledge" / "Concepts" / "llm-wiki.md"
+            app.write_text_file(
+                target_path,
+                "---\ntype: concept\nstatus: verified\ntags: [llm-wiki]\n---\n\n# LLM Wiki\n",
+            )
+
+            result = app.ingest_knowledge(
+                topic="自动知识入库",
+                session_content="确认由 Agent 自动保存会话检查点并编译成熟知识。",
+                distilled_content="# 自动知识入库\n\n## 核心机制\n\nAgent 自动保存、检索、编译和关联知识。\n",
+                lifecycle="knowledge",
+                schema_name="workflow",
+                relations=[{
+                    "target": "Knowledge/Concepts/llm-wiki.md",
+                    "type": "implements",
+                    "confidence": "high",
+                    "rationale": "该工作流实现 LLM Wiki 的持续编译模式。",
+                }],
+            )
+
+            self.assertEqual(result["action"], "created_knowledge_topic")
+            promoted_path = vault_root / result["to"]
+            self.assertTrue(promoted_path.exists())
+            text = app.read_text_file(promoted_path)
+            self.assertEqual(app.frontmatter_value(text, "status"), "verified")
+            self.assertIn("AI 关联（自动维护）", text)
+            self.assertEqual(result["relations_applied"][0]["type"], "implements")
 
 
 if __name__ == "__main__":
