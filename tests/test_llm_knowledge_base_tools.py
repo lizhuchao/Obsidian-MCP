@@ -170,6 +170,9 @@ class LlmKnowledgeBaseToolsTests(unittest.TestCase):
 
 [[Knowledge/Concepts/Real]]
 
+Inline `[[Knowledge/Inline Example]]` is documentation, not a link.
+[[...]]
+
 ```json
 {"value": [[906, 488]]}
 [[Knowledge/Missing Example]]

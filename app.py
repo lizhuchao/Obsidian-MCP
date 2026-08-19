@@ -74,7 +74,7 @@ DELETED_DIR = (VAULT_ROOT / DELETED_REL).resolve()
 MAX_CONTENT_BYTES = int(os.environ.get("MAX_CONTENT_BYTES", "300000"))
 MAX_ATTACHMENT_BYTES = int(os.environ.get("MAX_ATTACHMENT_BYTES", "15000000"))
 
-APP_VERSION = "2026-08-14-autonomous-knowledge-ingest-governance-repair"
+APP_VERSION = "2026-08-14-autonomous-knowledge-ingest-link-audit-repair"
 
 # This is deliberately short: MCP hosts may include it in every model context.
 # The complete, inspectable policy is exposed below as both a Resource and a Tool.
@@ -395,7 +395,7 @@ def embedded_asset_paths(text: str) -> list[str]:
 
 
 def without_fenced_code_blocks(text: str) -> str:
-    """Exclude fenced examples so JSON and Markdown samples are not treated as links."""
+    """Exclude fenced and inline examples so samples are not treated as links."""
     kept: list[str] = []
     in_fence = False
     for line in text.splitlines():
@@ -404,7 +404,7 @@ def without_fenced_code_blocks(text: str) -> str:
             continue
         if not in_fence:
             kept.append(line)
-    return "\n".join(kept)
+    return re.sub(r"`[^`\n]*`", "", "\n".join(kept))
 
 
 def wiki_link_targets(text: str) -> list[str]:
@@ -412,7 +412,7 @@ def wiki_link_targets(text: str) -> list[str]:
     targets = []
     for raw in re.findall(r"(?<!!)\[\[([^\]]+)\]\]", without_fenced_code_blocks(text)):
         target = raw.split("|", 1)[0].split("#", 1)[0].split("^", 1)[0].strip()
-        if target:
+        if target and not re.fullmatch(r"[.…\s]+", target):
             targets.append(target)
     return targets
 

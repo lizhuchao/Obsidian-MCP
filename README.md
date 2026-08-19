@@ -34,11 +34,13 @@
   - `append_inbox_note`
   - `archive_inbox_note`
 - Autonomous knowledge ingest
+  - `get_agent_contract`
   - `checkpoint_conversation`
   - `ingest_knowledge`
 - Knowledge lifecycle
   - `promote_inbox_note`
   - `update_knowledge_note`
+  - `patch_knowledge_metadata`
   - `append_knowledge_note`
   - `archive_knowledge_note`
   - `list_versions`
@@ -199,9 +201,18 @@ MCP 现在可以将经确认的笔记关系同时保存为 Obsidian 双链和 fr
 2. `ingest_knowledge` 保存调用方已经提炼过的内容，并记录该知识卡依赖的 checkpoint。
 3. 生命周期为 `incubating` 或 `review_needed` 时，内容仍留在 Inbox，供后续同主题对话持续更新。
 4. 生命周期为 `knowledge` 时，工具会按 schema 创建或更新正式 Knowledge 笔记，并在更新前自动归档旧版本。
-5. 调用方可同时传入经过确认的 `relations`，工具会复用关联写入校验和版本归档机制。
+5. 调用方可同时传入经过确认的 `tags` 和 `relations`，工具会复用 metadata/关联写入校验和版本归档机制。
+6. 正式 Knowledge 自动补齐 `created_at`、`updated_at`、`tags`、`confidence`、`owner` 等基础 Schema metadata；调用方仍负责提供符合所选 Schema 的正文语义和章节。
 
-这两个工具不自行调用模型或安排后台任务：AI 负责总结、判断成熟度和关系语义；MCP 负责受限、可追溯、可回滚的持久化。常规的“先写 Inbox、用户确认再 promote”流程仍然保留，适合需要人工审批的场景。
+MCP 在初始化响应中提供简短的 server instructions，并暴露完整 Contract Resource：`obsidian://agent-contract/autonomous-ingest`。支持该能力的 MCP host 可在连接时将入库规则提供给模型；`get_agent_contract` 是所有客户端可显式读取的回退入口。不同 host 是否自动注入 instructions 由客户端决定，因此应在每种客户端首次连接后验证。
+
+这些工具不自行调用模型或安排后台任务：AI 负责总结、判断成熟度和关系语义；MCP 负责受限、可追溯、可回滚的持久化。常规的“先写 Inbox、用户确认再 promote”流程仍然保留，适合需要人工审批的场景。
+
+### Metadata Repair and Link Audit
+
+`patch_knowledge_metadata` 用于为历史 Knowledge 笔记补齐 `type`、`tags`、`confidence` 或 `owner`，不重写正文；每次修复都会先保存 `Archive/Versions` 快照。
+
+`find_broken_note_links` 和 `audit_knowledge_base` 只把正文中的真实 Obsidian wiki link 计入断链检查，忽略 fenced code block、inline code 与纯占位符 `[[...]]`，避免 Markdown/JSON 示例污染知识图谱健康报告。
 
 ## Deployment
 
